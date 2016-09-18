@@ -53,7 +53,7 @@ public class TestParquetMetadataCache extends PlanTestBase {
         dataDir2);
   }
 
-  @Test // also a negative test case for DRILL-4530
+  @Test
   public void testPartitionPruningWithMetadataCache_1() throws Exception {
     test(String.format("refresh table metadata dfs_test.`%s/%s`", getDfsTestTmpSchemaLocation(), tableName1));
     checkForMetadataFile(tableName1);
@@ -67,11 +67,9 @@ public class TestParquetMetadataCache extends PlanTestBase {
     assertEquals(expectedRowCount, actualRowCount);
     String numFilesPattern = "numFiles=" + expectedNumFiles;
     String usedMetaPattern = "usedMetadataFile=true";
-    // since there are 2 or more sub-partitions the single partition cache file optimization does not apply
-    // and cacheFileRoot should point to the top level selectionRoot
-    String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s", getDfsTestTmpSchemaLocation(), tableName1);
+    String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s/1994", getDfsTestTmpSchemaLocation(), tableName1);
     PlanTestBase.testPlanMatchingPatterns(query, new String[]{numFilesPattern, usedMetaPattern, cacheFileRootPattern},
-        new String[] {"Filter"});
+        new String[] {});
   }
 
   @Test // DRILL-3917, positive test case for DRILL-4530
@@ -280,7 +278,7 @@ public class TestParquetMetadataCache extends PlanTestBase {
     String usedMetaPattern = "usedMetadataFile=true";
     String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s", getDfsTestTmpSchemaLocation(), tableName2);
     PlanTestBase.testPlanMatchingPatterns(query1, new String[]{numFilesPattern, usedMetaPattern, cacheFileRootPattern},
-        new String[] {"Filter"});
+        new String[] {});
   }
 
   @Test // DRILL-4530  // non-existent partition (1 subdirectory's cache file will still be read for schema)
@@ -323,6 +321,81 @@ public class TestParquetMetadataCache extends PlanTestBase {
     String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s", getDfsTestTmpSchemaLocation(), tableName1);
     PlanTestBase.testPlanMatchingPatterns(query, new String[]{numFilesPattern, usedMetaPattern, cacheFileRootPattern},
         new String[] {});
+  }
+
+  @Test // DRILL-4786
+  public void testDrill4786_1() throws Exception {
+    // create metadata cache
+    test(String.format("refresh table metadata dfs_test.`%s/%s`", getDfsTestTmpSchemaLocation(), tableName2));
+    checkForMetadataFile(tableName2);
+
+    // run query and check correctness
+    String query1 = String.format("select dir0, dir1, o_custkey, o_orderdate from dfs_test.`%s/%s` " +
+            " where dir0=1995 and dir1 in ('Q1', 'Q2')",
+        getDfsTestTmpSchemaLocation(), tableName2);
+
+    int expectedRowCount = 40;
+    int expectedNumFiles = 4;
+
+    int actualRowCount = testSql(query1);
+    assertEquals(expectedRowCount, actualRowCount);
+    String numFilesPattern = "numFiles=" + expectedNumFiles;
+    String usedMetaPattern = "usedMetadataFile=true";
+    String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s/1995", getDfsTestTmpSchemaLocation(), tableName2);
+    PlanTestBase.testPlanMatchingPatterns(query1, new String[]{numFilesPattern, usedMetaPattern, cacheFileRootPattern},
+        new String[] {});
+
+  }
+
+  @Test // DRILL-4786
+  public void testDrill4786_2() throws Exception {
+    // create metadata cache
+    test(String.format("refresh table metadata dfs_test.`%s/%s`", getDfsTestTmpSchemaLocation(), tableName2));
+    checkForMetadataFile(tableName2);
+
+    // run query and check correctness
+    String query1 = String.format("select dir0, dir1, o_custkey, o_orderdate from dfs_test.`%s/%s` " +
+            " where dir0 in (1994, 1995) and dir1 = 'Q3'",
+        getDfsTestTmpSchemaLocation(), tableName2);
+
+    int expectedRowCount = 40;
+    int expectedNumFiles = 4;
+
+    int actualRowCount = testSql(query1);
+    assertEquals(expectedRowCount, actualRowCount);
+    String numFilesPattern = "numFiles=" + expectedNumFiles;
+    String usedMetaPattern = "usedMetadataFile=true";
+    String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s", getDfsTestTmpSchemaLocation(), tableName2);
+    PlanTestBase.testPlanMatchingPatterns(query1, new String[]{numFilesPattern, usedMetaPattern, cacheFileRootPattern},
+        new String[] {});
+
+  }
+
+  @Test // DRILL-4877
+  public void testDrill4877() throws Exception {
+    // create metadata cache
+    test(String.format("refresh table metadata dfs_test.`%s/%s`", getDfsTestTmpSchemaLocation(), tableName2));
+    checkForMetadataFile(tableName2);
+
+    // run query and check correctness
+    String query1 = String.format("select max(dir0) as max0, max(dir1) as max1 from dfs_test.`%s/%s` ",
+        getDfsTestTmpSchemaLocation(), tableName2);
+
+    testBuilder()
+    .sqlQuery(query1)
+      .unOrdered()
+      .baselineColumns("max0", "max1")
+      .baselineValues("1995", "Q4")
+      .go();
+
+    int expectedNumFiles = 1; // point to selectionRoot since no pruning is done in this query
+
+    String numFilesPattern = "numFiles=" + expectedNumFiles;
+    String usedMetaPattern = "usedMetadataFile=true";
+    String cacheFileRootPattern = String.format("cacheFileRoot=%s/%s", getDfsTestTmpSchemaLocation(), tableName2);
+    PlanTestBase.testPlanMatchingPatterns(query1, new String[]{numFilesPattern, usedMetaPattern, cacheFileRootPattern},
+        new String[] {});
+
   }
 
   private void checkForMetadataFile(String table) throws Exception {

@@ -48,7 +48,6 @@ import org.apache.drill.exec.physical.base.GroupScan;
 import org.apache.drill.exec.planner.FileSystemPartitionDescriptor;
 import org.apache.drill.exec.planner.PartitionDescriptor;
 import org.apache.drill.exec.planner.PartitionLocation;
-import org.apache.drill.exec.planner.SimplePartitionLocation;
 import org.apache.drill.exec.planner.logical.DrillOptiq;
 import org.apache.drill.exec.planner.logical.DrillParseContext;
 import org.apache.drill.exec.planner.logical.DrillScanRel;
@@ -61,6 +60,8 @@ import org.apache.drill.exec.record.MaterializedField;
 import org.apache.drill.exec.record.VectorContainer;
 import org.apache.drill.exec.store.StoragePluginOptimizerRule;
 import org.apache.drill.exec.store.dfs.FormatSelection;
+import org.apache.drill.exec.store.dfs.MetadataContext;
+import org.apache.drill.exec.store.dfs.MetadataContext.PruneStatus;
 import org.apache.drill.exec.vector.NullableBitVector;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.plan.RelOptRule;
@@ -153,6 +154,12 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
     PartitionDescriptor descriptor = getPartitionDescriptor(settings, scanRel);
     final BufferAllocator allocator = optimizerContext.getAllocator();
 
+    final Object selection = getDrillTable(scanRel).getSelection();
+    MetadataContext metaContext = null;
+    if (selection instanceof FormatSelection) {
+         metaContext = ((FormatSelection)selection).getSelection().getMetaContext();
+    }
+
     RexNode condition = null;
     if (projectRel == null) {
       condition = filterRel.getCondition();
@@ -186,6 +193,7 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
     if (partitionColumnBitSet.isEmpty()) {
       logger.info("No partition columns are projected from the scan..continue. " +
           "Total pruning elapsed time: {} ms", totalPruningTime.elapsed(TimeUnit.MILLISECONDS));
+      setPruneStatus(metaContext, PruneStatus.NOT_PRUNED);
       return;
     }
 
@@ -207,6 +215,7 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
     if (pruneCondition == null) {
       logger.info("No conditions were found eligible for partition pruning." +
           "Total pruning elapsed time: {} ms", totalPruningTime.elapsed(TimeUnit.MILLISECONDS));
+      setPruneStatus(metaContext, PruneStatus.NOT_PRUNED);
       return;
     }
 
@@ -216,10 +225,9 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
     int batchIndex = 0;
     PartitionLocation firstLocation = null;
     LogicalExpression materializedExpr = null;
-    boolean checkForSingle = descriptor.supportsSinglePartOptimization();
-    boolean isSinglePartition = true;
     String[] spInfo = null;
     int maxIndex = -1;
+    BitSet matchBitSet = new BitSet();
 
     // Outer loop: iterate over a list of batches of PartitionLocations
     for (List<PartitionLocation> partitions : descriptor) {
@@ -261,6 +269,7 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
             // materializePruneExpr logs it already
             logger.info("Total pruning elapsed time: {} ms",
                 totalPruningTime.elapsed(TimeUnit.MILLISECONDS));
+            setPruneStatus(metaContext, PruneStatus.NOT_PRUNED);
             return;
           }
         }
@@ -279,41 +288,34 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
         int recordCount = 0;
         int qualifiedCount = 0;
 
-        if (checkForSingle &&
+        if (descriptor.supportsMetadataCachePruning() &&
             partitions.get(0).isCompositePartition() /* apply single partition check only for composite partitions */) {
           // Inner loop: within each batch iterate over the PartitionLocations
           for (PartitionLocation part : partitions) {
             assert part.isCompositePartition();
             if(!output.getAccessor().isNull(recordCount) && output.getAccessor().get(recordCount) == 1) {
               newPartitions.add(part);
-              if (isSinglePartition) { // only need to do this if we are already single partition
-                // compose the array of partition values for the directories that are referenced by filter:
-                // e.g suppose the dir hierarchy is year/quarter/month and the query is:
-                //     SELECT * FROM T WHERE dir0=2015 AND dir1 = 'Q1',
-                // then for 2015/Q1/Feb, this will have ['2015', 'Q1', null]
-                // Note that we are not using the PartitionLocation here but composing a different list because
-                // we are only interested in the directory columns that are referenced in the filter condition. not
-                // the SELECT list or other parts of the query.
-                Pair<String[], Integer> p = composePartition(referencedDirsBitSet, partitionMap, vectors, recordCount);
-                String[] parts = p.getLeft();
-                int tmpIndex = p.getRight();
-                if (spInfo == null) {
-                  for (int j = 0; j <= tmpIndex; j++) {
-                    if (parts[j] == null) { // prefixes should be non-null
-                      isSinglePartition = false;
-                      break;
-                    }
+              // Rather than using the PartitionLocation, get the array of partition values for the directories that are
+              // referenced by the filter since we are not interested in directory references in other parts of the query.
+              Pair<String[], Integer> p = composePartition(referencedDirsBitSet, partitionMap, vectors, recordCount);
+              String[] parts = p.getLeft();
+              int tmpIndex = p.getRight();
+              maxIndex = Math.max(maxIndex, tmpIndex);
+              if (spInfo == null) { // initialization
+                spInfo = parts;
+                for (int j = 0; j <= tmpIndex; j++) {
+                  if (parts[j] != null) {
+                    matchBitSet.set(j);
                   }
-                  spInfo = parts;
-                  maxIndex = tmpIndex;
-                } else if (maxIndex != tmpIndex) {
-                  isSinglePartition = false;
-                } else {
-                  // we only want to compare until the maxIndex inclusive since subsequent values would be null
-                  for (int j = 0; j <= maxIndex; j++) {
-                    if (!spInfo[j].equals(parts[j])) {
-                      isSinglePartition = false;
-                      break;
+                }
+              } else {
+                // compare the new partition with existing partition
+                for (int j=0; j <= tmpIndex; j++) {
+                  if (parts[j] == null || spInfo[j] == null) { // nulls don't match
+                    matchBitSet.clear(j);
+                  } else {
+                    if (!parts[j].equals(spInfo[j])) {
+                      matchBitSet.clear(j);
                     }
                   }
                 }
@@ -337,6 +339,8 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
       } catch (Exception e) {
         logger.warn("Exception while trying to prune partition.", e);
         logger.info("Total pruning elapsed time: {} ms", totalPruningTime.elapsed(TimeUnit.MILLISECONDS));
+
+        setPruneStatus(metaContext, PruneStatus.NOT_PRUNED);
         return; // continue without partition pruning
       } finally {
         container.clear();
@@ -387,17 +391,36 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
       condition = condition.accept(reverseVisitor);
       pruneCondition = pruneCondition.accept(reverseVisitor);
 
-      if (checkForSingle && isSinglePartition && !wasAllPartitionsPruned) {
+      if (descriptor.supportsMetadataCachePruning() && !wasAllPartitionsPruned) {
         // if metadata cache file could potentially be used, then assign a proper cacheFileRoot
-        String path = "";
-        for (int j = 0; j <= maxIndex; j++) {
-          path += "/" + spInfo[j];
+        int index = -1;
+        if (!matchBitSet.isEmpty()) {
+          String path = "";
+          index = matchBitSet.length() - 1;
+
+          for (int j = 0; j < matchBitSet.length(); j++) {
+            if (!matchBitSet.get(j)) {
+              // stop at the first index with no match and use the immediate
+              // previous index
+              index = j-1;
+              break;
+            }
+          }
+          for (int j=0; j <= index; j++) {
+            path += "/" + spInfo[j];
+          }
+          cacheFileRoot = descriptor.getBaseTableLocation() + path;
         }
-        cacheFileRoot = descriptor.getBaseTableLocation() + path;
+        if (index != maxIndex) {
+          // if multiple partitions are being selected, we should not drop the filter
+          // since we are reading the cache file at a parent/ancestor level
+          canDropFilter = false;
+        }
+
       }
 
-      RelNode inputRel = descriptor.supportsSinglePartOptimization() ?
-          descriptor.createTableScan(newPartitions, cacheFileRoot, wasAllPartitionsPruned) :
+      RelNode inputRel = descriptor.supportsMetadataCachePruning() ?
+          descriptor.createTableScan(newPartitions, cacheFileRoot, wasAllPartitionsPruned, metaContext) :
             descriptor.createTableScan(newPartitions, wasAllPartitionsPruned);
 
       if (projectRel != null) {
@@ -411,6 +434,8 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
         call.transformTo(newFilter);
       }
 
+      setPruneStatus(metaContext, PruneStatus.PRUNED);
+
     } catch (Exception e) {
       logger.warn("Exception while using the pruned partitions.", e);
     } finally {
@@ -418,6 +443,13 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
     }
   }
 
+  /** Compose the array of partition values for the directories that are referenced by filter:
+   *  e.g suppose the dir hierarchy is year/quarter/month and the query is:
+   *     SELECT * FROM T WHERE dir0=2015 AND dir1 = 'Q1',
+   * then for 2015/Q1/Feb, this will have ['2015', 'Q1', null]
+   * If the query filter condition is WHERE dir1 = 'Q2'  (i.e no dir0 condition) then the array will
+   * have [null, 'Q2', null]
+   */
   private Pair<String[], Integer> composePartition(BitSet referencedDirsBitSet,
       Map<Integer, Integer> partitionMap,
       ValueVector[] vectors,
@@ -471,14 +503,18 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
 
   public abstract PartitionDescriptor getPartitionDescriptor(PlannerSettings settings, TableScan scanRel);
 
+  private static DrillTable getDrillTable(final TableScan scan) {
+    DrillTable drillTable;
+    drillTable = scan.getTable().unwrap(DrillTable.class);
+    if (drillTable == null) {
+      drillTable = scan.getTable().unwrap(DrillTranslatableTable.class).getDrillTable();
+    }
+    return drillTable;
+  }
+
   private static boolean isQualifiedDirPruning(final TableScan scan) {
     if (scan instanceof EnumerableTableScan) {
-      DrillTable drillTable;
-      drillTable = scan.getTable().unwrap(DrillTable.class);
-      if (drillTable == null) {
-        drillTable = scan.getTable().unwrap(DrillTranslatableTable.class).getDrillTable();
-      }
-      final Object selection = drillTable.getSelection();
+      final Object selection = getDrillTable(scan).getSelection();
       if (selection instanceof FormatSelection
           && ((FormatSelection)selection).supportDirPruning()) {
         return true;  // Do directory-based pruning in Calcite logical
@@ -491,6 +527,12 @@ public abstract class PruneScanRule extends StoragePluginOptimizerRule {
       return groupScan instanceof FileGroupScan && groupScan.supportsPartitionFilterPushdown() && !((DrillScanRel)scan).partitionFilterPushdown();
     }
     return false;
+  }
+
+  private static void setPruneStatus(MetadataContext metaContext, PruneStatus pruneStatus) {
+    if (metaContext != null) {
+      metaContext.setPruneStatus(pruneStatus);
+    }
   }
 
 }
